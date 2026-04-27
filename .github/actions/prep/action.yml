@@ -1,0 +1,238 @@
+name: macOS build prep
+description: >-
+  Prepare a GitHub-hosted macOS runner for statically-linked R package builds.
+  Evicts Homebrew, pins Xcode, installs gfortran with a static-FLIBS Makevars,
+  and unpacks CRAN-compatible static sysdeps under /opt/R/{arch}.
+
+inputs:
+  r-version:
+    description: R minor version (e.g. "4.5"). Selects gfortran version and sysdeps bundle.
+    required: true
+  sysdeps-release:
+    description: >-
+      Release tag of r-universe-org/macos-libs to consume for static sysdeps.
+      Content is a repackage of mac.r-project.org/bin/darwin23.
+    required: false
+    default: "2025-12-13"
+
+runs:
+  using: composite
+  steps:
+    - name: Resolve arch and gfortran version
+      id: resolve
+      shell: bash
+      run: |
+        set -euo pipefail
+        arch="$(uname -m)"
+        case "$arch" in
+          arm64|aarch64) arch=arm64; triple=aarch64-apple-darwin20.0 ;;
+          x86_64)        arch=x86_64; triple=x86_64-apple-darwin20.0 ;;
+          *) echo "::error::unsupported arch $arch"; exit 1 ;;
+        esac
+
+        rver="${{ inputs.r-version }}"
+        case "$rver" in
+          4.5*|4.6*)
+            gfortran_pkg_url="https://github.com/R-macos/gcc-14-branch/releases/download/gcc-14.2-darwin-r2.1/gfortran-14.2-universal.pkg"
+            gfortran_ver=14.2.0
+            # gfortran 14 ships libheapt_w.a for static TLS heap support.
+            gfortran_static_libs='libemutls_w.a libheapt_w.a'
+            ;;
+          4.4*)
+            gfortran_pkg_url="https://github.com/R-macos/gcc-12-branch/releases/download/12.2-darwin-r0.1/gfortran-12.2-universal.pkg"
+            gfortran_ver=12.2.0
+            # gfortran 12 does not ship libheapt_w.a.
+            gfortran_static_libs='libemutls_w.a'
+            ;;
+          *) echo "::error::unsupported R version $rver"; exit 1 ;;
+        esac
+
+        {
+          echo "arch=$arch"
+          echo "triple=$triple"
+          echo "gfortran_pkg_url=$gfortran_pkg_url"
+          echo "gfortran_ver=$gfortran_ver"
+          echo "gfortran_static_libs=$gfortran_static_libs"
+          echo "cranpath=/opt/R/$arch"
+        } >> "$GITHUB_OUTPUT"
+
+    - name: Restore toolchain cache
+      id: cache
+      uses: actions/cache@v4
+      with:
+        path: |
+          /opt/X11
+          /opt/gfortran
+          /opt/R/arm64
+          /opt/R/x86_64
+        key: macos-prep-${{ runner.os }}-${{ inputs.r-version }}-${{ steps.resolve.outputs.arch }}-${{ inputs.sysdeps-release }}-v1
+
+    - name: Pin Xcode and deployment target
+      shell: bash
+      run: |
+        set -euo pipefail
+        # Prefer a recent Xcode that ships a modern SDK. xcode-select failures are
+        # non-fatal: if the pinned app isn't present, fall back to runner default.
+        if [ "${{ steps.resolve.outputs.arch }}" = "arm64" ]; then
+          sudo xcode-select -s /Applications/Xcode_16.2.app || true
+          echo "MACOSX_DEPLOYMENT_TARGET=14.0" >> "$GITHUB_ENV"
+        else
+          sudo xcode-select -s /Applications/Xcode_16.2.app || true
+          echo "MACOSX_DEPLOYMENT_TARGET=11.0" >> "$GITHUB_ENV"
+        fi
+
+    - name: Evict Homebrew from PATH
+      shell: bash
+      run: |
+        set -euo pipefail
+        # Rationale: dynamic libs under /usr/local (Intel) or /opt/homebrew (arm) can
+        # leak into R package builds and break static linking guarantees. Preserve a
+        # few non-lib tools we rely on, then move brew out of the way.
+        if ! command -v brew >/dev/null 2>&1; then
+          echo "brew not present; nothing to evict"
+          exit 0
+        fi
+        brew_prefix="$(brew --prefix)"
+        brew_repo="$(brew --repo)"
+
+        keep_dir="$(mktemp -d)"
+        for bin in gtar git-lfs rustup-init; do
+          path="$(command -v "$bin" || true)"
+          [ -n "$path" ] && cp "$path" "$keep_dir/" || true
+        done
+
+        brew unlink $(brew list --formula) || true
+        if [ -d "$brew_prefix/Cellar" ]; then
+          sudo mv "$brew_prefix/Cellar" "$brew_prefix/Cellar.old"
+        fi
+        sudo rm -vf "$(command -v brew)" || true
+        if [ -d "$brew_repo" ] && [ "$brew_repo" != "$brew_prefix" ]; then
+          sudo mv "$brew_repo" "$brew_repo.old"
+        fi
+
+        sudo mkdir -p /usr/local/bin
+        sudo cp -f "$keep_dir"/* /usr/local/bin/ 2>/dev/null || true
+        hash -r
+
+    - name: Ensure Rust toolchain
+      shell: bash
+      run: |
+        set -euo pipefail
+        # Some R packages (yaml12, gifski, cargo-shim wrappers) require rustc.
+        # Brew-provided rust is gone after eviction; install via rustup if missing.
+        if command -v rustc >/dev/null 2>&1; then
+          echo "rustc already on PATH: $(command -v rustc)"
+        else
+          if command -v rustup-init >/dev/null 2>&1; then
+            rustup-init -y --default-toolchain stable --profile minimal --no-modify-path
+          else
+            curl --retry 3 --fail-with-body -sSf https://sh.rustup.rs | sh -s -- \
+              -y --default-toolchain stable --profile minimal --no-modify-path
+          fi
+        fi
+        echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+
+    - name: Install XQuartz
+      shell: bash
+      run: |
+        set -euo pipefail
+        # Required: cranlibs' cairo.pc enables the xlib backend and its
+        # Requires.private points at X11 libs. Without XQuartz, pkg-config
+        # silently fails to resolve cairo and downstream package configures
+        # error out (e.g. Cairo, Rgraphviz, tcltk-linked pkgs).
+        if [ -d /opt/X11 ] && [ -f /Applications/Utilities/XQuartz.app/Contents/Info.plist ]; then
+          echo "XQuartz already present"
+          exit 0
+        fi
+        pkgfile="XQuartz-2.8.5.pkg"
+        curl --retry 3 --fail-with-body -sSL \
+          "https://github.com/XQuartz/XQuartz/releases/download/XQuartz-2.8.5/$pkgfile" -o "$pkgfile"
+        sudo installer -pkg "$pkgfile" -target /
+        rm -f "$pkgfile"
+
+    - name: Install gfortran
+      if: steps.cache.outputs.cache-hit != 'true' || !hashFiles('/opt/gfortran/bin/gfortran')
+      shell: bash
+      run: |
+        set -euo pipefail
+        if [ -x /opt/gfortran/bin/gfortran ]; then
+          echo "gfortran already present"
+          exit 0
+        fi
+        curl --retry 3 --fail-with-body -sSL \
+          "${{ steps.resolve.outputs.gfortran_pkg_url }}" -o gfortran.pkg
+        sudo installer -pkg gfortran.pkg -target /
+        rm -f gfortran.pkg
+
+    - name: Install CRAN static sysdeps
+      if: steps.cache.outputs.cache-hit != 'true' || !hashFiles(format('{0}/bin/pkg-config', steps.resolve.outputs.cranpath))
+      shell: bash
+      run: |
+        set -euo pipefail
+        cranpath="${{ steps.resolve.outputs.cranpath }}"
+        if [ -x "$cranpath/bin/pkg-config" ]; then
+          echo "sysdeps already present at $cranpath"
+          exit 0
+        fi
+        url="https://github.com/r-universe-org/macos-libs/releases/download/${{ inputs.sysdeps-release }}/cranlibs-everything.tar.xz"
+        curl --retry 3 --fail-with-body -sSL "$url" -o libs.tar.xz
+        sudo tar -xf libs.tar.xz -C / opt
+        rm -f libs.tar.xz
+
+    - name: Write ~/.R/Makevars for static Fortran linking
+      shell: bash
+      run: |
+        set -euo pipefail
+        triple="${{ steps.resolve.outputs.triple }}"
+        gver="${{ steps.resolve.outputs.gfortran_ver }}"
+        gcc_libdir="/opt/gfortran/lib/gcc/${triple}/${gver}"
+        static_libs=""
+        for lib in ${{ steps.resolve.outputs.gfortran_static_libs }}; do
+          static_libs="$static_libs ${gcc_libdir}/${lib}"
+        done
+        mkdir -p "$HOME/.R"
+        cat > "$HOME/.R/Makevars" <<EOF
+        # Generated by .github/actions/macos-prep. Static-link gfortran support
+        # libraries while leaving the Fortran runtime dynamic against R's
+        # bundled copy. See R-SIG-Mac May 2024 thread.
+        FLIBS =${static_libs} -L/Library/Frameworks/R.framework/Resources/lib -lgfortran.5 -lquadmath.0
+        MAKEFLAGS = -j4
+        EOF
+
+    - name: Configure Java and start Xvfb
+      shell: bash
+      run: |
+        set -euo pipefail
+        # Point R at the runner's JDK 21 and re-run javareconf so JNI headers
+        # and lib paths match. The stale JDK 11 otherwise embedded in some R
+        # installers makes rJava's configure fail its JNI compile test.
+        if [ "$(uname -m)" = "arm64" ] && [ -n "${JAVA_HOME_21_arm64:-}" ]; then
+          jh="$JAVA_HOME_21_arm64"
+        elif [ -n "${JAVA_HOME_21_X64:-}" ]; then
+          jh="$JAVA_HOME_21_X64"
+        else
+          jh="$(/usr/libexec/java_home -v 21 2>/dev/null || /usr/libexec/java_home)"
+        fi
+        echo "JAVA_HOME=$jh" >> "$GITHUB_ENV"
+        export JAVA_HOME="$jh"
+        sudo R CMD javareconf || true
+
+        # rJava and other JVM-loading packages require a DISPLAY during the
+        # install-time load test. Xvfb is shipped with XQuartz at /opt/X11.
+        if [ -x /opt/X11/bin/Xvfb ]; then
+          sudo nohup /opt/X11/bin/Xvfb :6 -screen 0 1280x1024x24 > "$HOME/X.log" 2>&1 &
+          echo "DISPLAY=:6" >> "$GITHUB_ENV"
+        fi
+
+    - name: Export PATH and sysdeps env
+      shell: bash
+      run: |
+        set -euo pipefail
+        cranpath="${{ steps.resolve.outputs.cranpath }}"
+        echo "$cranpath/bin" >> "$GITHUB_PATH"
+        echo "/opt/gfortran/bin" >> "$GITHUB_PATH"
+        {
+          echo "PKG_CONFIG_PATH=$cranpath/lib/pkgconfig:$cranpath/share/pkgconfig:/usr/lib/pkgconfig:/opt/X11/lib/pkgconfig:/opt/X11/share/pkgconfig"
+          echo "PROJ_LIB=$cranpath/share/proj"
+          echo "PROJ_GDAL_DATA_COPY=TRUE"
+        } >> "$GITHUB_ENV"
