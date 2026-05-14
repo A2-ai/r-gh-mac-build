@@ -189,8 +189,26 @@ runs:
         fi
         url="https://github.com/r-universe-org/macos-libs/releases/download/${{ inputs.sysdeps-release }}/cranlibs-everything.tar.xz"
         curl --retry 3 --fail-with-body -sSL "$url" -o libs.tar.xz
-        sudo tar -xf libs.tar.xz -C / opt
-        rm -f libs.tar.xz
+        # The tarball contains both arm64 and x86_64 trees with cross-arch
+        # symlinks; on a single-arch runner tar prints tens of thousands of
+        # "Cannot mkdir / Cannot open" warnings for the absent arch while
+        # still extracting the present one successfully. Capture stderr to a
+        # log and only surface it on failure (or when debug=true).
+        log="$(mktemp)"
+        echo "::group::extract cranlibs-everything.tar.xz"
+        if [ "${{ inputs.debug }}" = "true" ]; then
+          sudo tar -xf libs.tar.xz -C / opt
+        else
+          if ! sudo tar -xf libs.tar.xz -C / opt 2>"$log"; then
+            echo "::error::tar extraction failed; dumping log"
+            cat "$log"
+            exit 1
+          fi
+          warn_count=$(grep -c . "$log" || true)
+          echo "extracted sysdeps ($warn_count cross-arch symlink warnings suppressed; set debug: true to see them)"
+        fi
+        echo "::endgroup::"
+        rm -f libs.tar.xz "$log"
 
     - name: Write ~/.R/Makevars for static Fortran linking
       shell: bash
