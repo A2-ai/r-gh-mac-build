@@ -14,6 +14,10 @@ inputs:
       Content is a repackage of mac.r-project.org/bin/darwin23.
     required: false
     default: "2025-12-13"
+  debug:
+    description: When "true", show full brew-unlink output (10k+ lines). Default suppresses it and prints a one-line summary.
+    required: false
+    default: "false"
 
 runs:
   using: composite
@@ -101,11 +105,20 @@ runs:
           [ -n "$path" ] && cp "$path" "$keep_dir/" || true
         done
 
-        brew unlink $(brew list --formula) || true
+        formulas=$(brew list --formula)
+        formula_count=$(printf '%s\n' "$formulas" | grep -c . || true)
+        echo "::group::brew unlink ($formula_count formulas)"
+        if [ "${{ inputs.debug }}" = "true" ]; then
+          brew unlink $formulas || true
+        else
+          brew unlink $formulas >/dev/null 2>&1 || true
+          echo "unlinked $formula_count formulas (output suppressed; set debug: true to see per-symlink lines)"
+        fi
+        echo "::endgroup::"
         if [ -d "$brew_prefix/Cellar" ]; then
           sudo mv "$brew_prefix/Cellar" "$brew_prefix/Cellar.old"
         fi
-        sudo rm -vf "$(command -v brew)" || true
+        sudo rm -f "$(command -v brew)" || true
         if [ -d "$brew_repo" ] && [ "$brew_repo" != "$brew_prefix" ]; then
           sudo mv "$brew_repo" "$brew_repo.old"
         fi
