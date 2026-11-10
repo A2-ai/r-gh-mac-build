@@ -139,7 +139,7 @@ runs:
           if command -v rustup-init >/dev/null 2>&1; then
             rustup-init -y --default-toolchain stable --profile minimal --no-modify-path
           else
-            curl --retry 3 --fail-with-body -sSf https://sh.rustup.rs | sh -s -- \
+            curl --retry 3 --fail-with-body -sS https://sh.rustup.rs | sh -s -- \
               -y --default-toolchain stable --profile minimal --no-modify-path
           fi
         fi
